@@ -1,15 +1,17 @@
+from datetime import datetime
+
 import tensorflow as tf
 
 # hyperparameters
-batch_size = 8 # how many independent sequences will we process in parallel?
-block_size = 8 # what is the maximum context length for predictions?
+batch_size = 64 # how many independent sequences will we process in parallel?
+block_size = 256 # what is the maximum context length for predictions?
 max_iters = 5000
 eval_interval = 500
 learning_rate = 3e-4
 # device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 device='cpu'
 eval_iters = 200
-n_embed = 32
+n_embed = 384
 n_head = 6
 n_layer = 6
 dropout = 0.2
@@ -26,7 +28,7 @@ class FeedForward(tf.keras.Model):
     def __init__(self, n_embed):
         super().__init__()
         self.linear_1 = tf.keras.layers.Dense(input_shape=(n_embed, ), units=4*n_embed, activation='relu')
-        self.linear_2 = tf.keras.layers.Dense(units = n_embed)
+        self.linear_2 = tf.keras.layers.Dense(units=n_embed)
         self.dropout = tf.keras.layers.Dropout(dropout)
 
     def call(self, x):
@@ -48,9 +50,10 @@ class Block(tf.keras.Model):
         self.ln2 = tf.keras.layers.LayerNormalization()
     
     def call(self, x):
-        x = x + self.sa(self.ln1(x), self.ln1(x))
+        x = x + self.sa(self.ln1(x), self.ln1(x), use_causal_mask=True)
         x = x + self.ffwd(self.ln2(x))
         return x
+
 
 class BigramLanguageModel(tf.keras.Model):
     def __init__(self):
@@ -63,10 +66,10 @@ class BigramLanguageModel(tf.keras.Model):
         self.ln_f = tf.keras.layers.LayerNormalization()
         self.lm_head = tf.keras.layers.Dense(units=vocab_size)
 
-    def call(self, idx, targets=None):
-        B, T = idx.shape
+    def call(self, inputs):
+        B, T = inputs.shape
 
-        tok_emb = self.token_embedding_table(idx)
+        tok_emb = self.token_embedding_table(inputs)
         pos_emb = self.position_embedding_table(tf.range(T))
         x = tok_emb + pos_emb
         x = self.blocks(x)
@@ -99,7 +102,7 @@ def get_tf_dataset(data):
     indices = tf.range(tf.shape(data)[0] - block_size)
     dataset = tf.data.Dataset.from_tensor_slices(indices)
     dataset = dataset.map(extract_data_and_target)
-    return dataset
+    return dataset.batch(batch_size)
 
 def extract_data_and_target(index):
     # Assume that the data is the value at the index and the target is the next value
@@ -107,23 +110,36 @@ def extract_data_and_target(index):
     y = tf.slice(data, [index+1], [block_size])
     return x, y
 
-indices = tf.range(tf.shape(data)[0] - block_size)
-dataset = tf.data.Dataset.from_tensor_slices(indices)
-dataset = dataset.map(extract_data_and_target)
-# Batch your dataset
-batch_size = 4
-dataset = dataset.batch(batch_size)
+# indices = tf.range(tf.shape(data)[0] - block_size)
+# dataset = tf.data.Dataset.from_tensor_slices(indices)
+# dataset = dataset.map(extract_data_and_target)
+# # Batch your dataset
+# batch_size = 4
+# dataset = dataset.batch(batch_size)
 
-model = BigramLanguageModel()
-model.compile(
-    optimizer=tf.keras.optimizers.AdamW(learning_rate=learning_rate),
-    loss=tf.keras.losses.CategoricalCrossentropy()
-)
-history = model.fit(
-    get_tf_dataset(train_data),
-    epochs=5,
-    steps_per_epoch=1000,
-    validation_data=get_tf_dataset(val_data),
-    batch_size=batch_size
-)
+
+# Define your custom loss function
+def my_loss(y_true, y_pred_logits):
+    # Compute the cross-entropy loss using the logits
+    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(y_true, y_pred_logits)
+    # Return the mean loss across all examples in the batch
+    return tf.reduce_mean(loss)
+
+
+if __name__ == "__main__":
+    model = BigramLanguageModel()
+    model.compile(
+        optimizer=tf.keras.optimizers.AdamW(learning_rate=learning_rate),
+        loss=my_loss
+    )
+    log_dir = "logs/fit/" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
+    history = model.fit(
+        get_tf_dataset(train_data),
+        epochs=5,
+        steps_per_epoch=1000,
+        validation_data=get_tf_dataset(val_data),
+        callbacks=[tensorboard_callback]
+    )
+    model.save("nanogpt_keras.pb")
 
